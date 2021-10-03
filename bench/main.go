@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -33,9 +34,7 @@ func main() {
 	flag.BoolVar(&showGraph, "g", showGraph, "show a graph with response times")
 	flag.Parse()
 
-	ctx := context.Background()
-
-	var wg sync.WaitGroup
+	// prepare requesters
 	requesters := make([]*Requester, connections)
 	for i, _ := range requesters {
 		requesters[i] = &Requester{
@@ -47,6 +46,11 @@ func main() {
 		}
 	}
 
+	// run requesters
+	var (
+		wg  sync.WaitGroup
+		ctx = context.Background()
+	)
 	for _, requester := range requesters {
 		wg.Add(1)
 		go func(r *Requester) {
@@ -57,68 +61,100 @@ func main() {
 			wg.Done()
 		}(requester)
 	}
+
 	time.Sleep(duration)
 	for _, r := range requesters {
 		r.Stop()
 	}
 	wg.Wait()
-	var (
-		totalRequestDuration time.Duration
-		minDuration          = time.Hour
-		maxDuration          time.Duration
-	)
-	totalRequests := 0
-	totalConnections := 0
-	requestDurations := []time.Duration{}
-	min := float64(len(requesters[0].requests)) / duration.Seconds()
-	max := 0.0
-	for _, requester := range requesters {
-		requests := len(requester.requests)
-		req := float64(requests) / duration.Seconds()
-		if req < min {
-			min = req
-		}
-		if req > max {
-			max = req
-		}
-		for _, request := range requester.requests {
-			if request.Duration < minDuration {
-				minDuration = request.Duration
-			}
-			if request.Duration > maxDuration {
-				maxDuration = request.Duration
-			}
-			totalRequestDuration += request.Duration
-			requestDurations = append(requestDurations, request.Duration)
-		}
-		totalRequests += requests
-		totalConnections += len(requester.connections)
-	}
 
-	sort.Slice(requestDurations, func(i, j int) bool { return requestDurations[i] < requestDurations[j] })
+	// print results
+	result := ResultFromRequesters(requesters, duration)
 
-	fmt.Printf("total connections: %d\n", totalConnections)
-	fmt.Printf("requests:\n  total %d\n  throughput %.2f req/s\n", totalRequests, float64(totalRequests)/duration.Seconds())
-	fmt.Printf("per connection:\n  min %.2f req/s\n  max %.2f req/s\n  avg %.2f req/s\n", min, max, float64(totalRequests)/float64(connections)/duration.Seconds())
-	fmt.Printf("request duration:\n  min %s\n  max %s\n  avg %s\n", minDuration, maxDuration, totalRequestDuration/time.Duration(totalRequests))
-	indexP95 := percentile(len(requestDurations), 0.95)
-	indexP99 := percentile(len(requestDurations), 0.99)
-	fmt.Printf("  p95 %s\n  p99 %s\n", requestDurations[indexP95], requestDurations[indexP99])
-	fmt.Printf("min %s  %d\n", requestDurations[0], len(requestDurations))
-
+	fmt.Println(result.Text())
 	if showGraph {
-		chart := goterm.NewLineChart(100, 20)
-		data := &goterm.DataTable{}
-		data.AddColumn("request")
-		data.AddColumn("duration")
-
-		for i, dur := range requestDurations {
-			data.AddRow(float64(i), dur.Seconds())
-		}
-
-		goterm.Println(chart.Draw(data))
-		goterm.Flush()
+		printTerminalGraph(result)
 	}
+
+}
+
+type Result struct {
+	Duration               time.Duration
+	ConnectionsTotal       int
+	RequestsTotal          int
+	RequestsPerSecond      float64
+	RequestDurationTotal   time.Duration
+	RequestDurationAverage time.Duration
+	RequestDurationMin     time.Duration
+	RequestDurationMax     time.Duration
+	RequestDurationP95     time.Duration
+	RequestDurationP99     time.Duration
+	Durations              []time.Duration
+}
+
+func ResultFromRequesters(requesters []*Requester, duration time.Duration) *Result {
+	result := &Result{
+		RequestDurationMin: time.Hour,
+		Duration:           duration,
+	}
+
+	for _, requester := range requesters {
+		result.RequestsTotal += len(requester.requests)
+
+		result.ConnectionsTotal += len(requester.connections)
+
+		for _, request := range requester.requests {
+			if request.Duration < result.RequestDurationMin {
+				result.RequestDurationMin = request.Duration
+			}
+			if request.Duration > result.RequestDurationMax {
+				result.RequestDurationMax = request.Duration
+			}
+			result.RequestDurationTotal += request.Duration
+			result.Durations = append(result.Durations, request.Duration)
+		}
+	}
+
+	result.RequestsPerSecond = float64(result.RequestsTotal) / result.Duration.Seconds()
+	result.RequestDurationAverage = result.RequestDurationTotal / time.Duration(result.RequestsTotal)
+
+	sort.Slice(result.Durations, func(i, j int) bool { return result.Durations[i] < result.Durations[j] })
+	indexP95 := percentile(len(result.Durations), 0.95)
+	indexP99 := percentile(len(result.Durations), 0.99)
+	result.RequestDurationP95 = result.Durations[indexP95]
+	result.RequestDurationP99 = result.Durations[indexP99]
+
+	return result
+}
+
+func (r *Result) Text() string {
+	out := &bytes.Buffer{}
+
+	fmt.Fprintf(out, "total connections: %d\n", r.ConnectionsTotal)
+	fmt.Fprintf(out, "requests:\n")
+	fmt.Fprintf(out, "  total %d\n", r.RequestsTotal)
+	fmt.Fprintf(out, "  throughput %.2f req/s\n", r.RequestsPerSecond)
+	fmt.Fprintf(out, "request duration:\n")
+	fmt.Fprintf(out, "  avg %s\n", r.RequestDurationAverage)
+	fmt.Fprintf(out, "  min %s\n", r.RequestDurationMin)
+	fmt.Fprintf(out, "  max %s\n", r.RequestDurationMax)
+	fmt.Fprintf(out, "  p95 %s\n", r.RequestDurationP95)
+	fmt.Fprintf(out, "  p99 %s\n", r.RequestDurationP99)
+	return out.String()
+}
+
+func printTerminalGraph(r *Result) {
+	chart := goterm.NewLineChart(100, 20)
+	data := &goterm.DataTable{}
+	data.AddColumn("request")
+	data.AddColumn("duration")
+
+	for i, duration := range r.Durations {
+		data.AddRow(float64(i), duration.Seconds())
+	}
+
+	goterm.Println(chart.Draw(data))
+	goterm.Flush()
 }
 
 func percentile(i int, p float64) int {
