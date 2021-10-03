@@ -5,12 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
 
-const TargetAddr = "127.0.0.1:1234"
+const DefaultTargetAddr = "127.0.0.1:1234"
 
 func main() {
 	var (
@@ -18,95 +20,160 @@ func main() {
 		requestSize     = 1024
 		duration        = time.Second * 1
 		requestsPerConn = 0
+		target          string
 	)
 	flag.IntVar(&connections, "c", connections, "number of parallel connections")
-	flag.IntVar(&requestSize, "s", requestSize, "request size in bytes")
+	flag.IntVar(&requestSize, "s", requestSize, "request jize in bytes")
 	flag.IntVar(&requestsPerConn, "r", requestsPerConn, "how many requests do we send through one connection. if zero only one connection is used for all requests")
+	flag.StringVar(&target, "t", DefaultTargetAddr, "target address")
 	flag.DurationVar(&duration, "d", duration, "how long we run the test")
 	flag.Parse()
 
-	ctx, _ := context.WithDeadline(context.Background(), time.Now().Add(duration))
+	ctx := context.Background()
 
 	var wg sync.WaitGroup
-	requests := make([]int, connections)
+	requesters := make([]*Requester, connections)
+	for i, _ := range requesters {
+		requesters[i] = &Requester{
+			id:              i,
+			size:            requestSize,
+			requestsPerConn: requestsPerConn,
+			target:          target,
+			done:            make(chan struct{}),
+		}
+	}
 
-	for i := 0; i < connections; i++ {
+	for _, requester := range requesters {
 		wg.Add(1)
-		go func(i int) {
-			var err error
-			requests[i], err = test(ctx, requestSize, requestsPerConn)
+		go func(r *Requester) {
+			err := r.Run(ctx)
 			if err != nil {
 				log.Println(err)
 			}
 			wg.Done()
-		}(i)
+		}(requester)
+	}
+	time.Sleep(duration)
+	for _, r := range requesters {
+		r.Stop()
 	}
 	wg.Wait()
-	total := 0
-	min := float64(requests[0]) / duration.Seconds()
+	var (
+		totalRequestDuration time.Duration
+		minDuration          = time.Hour
+		maxDuration          time.Duration
+	)
+	totalRequests := 0
+	totalConnections := 0
+	requestDurations := []time.Duration{}
+	min := float64(len(requesters[0].requests)) / duration.Seconds()
 	max := 0.0
-	for _, request := range requests {
-		req := float64(request) / duration.Seconds()
+	for _, requester := range requesters {
+		requests := len(requester.requests)
+		req := float64(requests) / duration.Seconds()
 		if req < min {
 			min = req
 		}
 		if req > max {
 			max = req
 		}
-		total += request
+		for _, request := range requester.requests {
+			if request.Duration < minDuration {
+				minDuration = request.Duration
+			}
+			if request.Duration > maxDuration {
+				maxDuration = request.Duration
+			}
+			totalRequestDuration += request.Duration
+			requestDurations = append(requestDurations, request.Duration)
+		}
+		totalRequests += requests
+		totalConnections += len(requester.connections)
 	}
-	fmt.Printf("total: %.2f req/s\n", float64(total)/duration.Seconds())
-	fmt.Printf("per connection:\n  min %.2f req/s\n  max %.2f req/s\n  avg %.2f req/s\n", min, max, float64(total)/float64(connections)/duration.Seconds())
+
+	sort.Slice(requestDurations, func(i, j int) bool { return requestDurations[i] < requestDurations[j] })
+
+	fmt.Printf("total connections: %d\n", totalConnections)
+	fmt.Printf("requests:\n  total %d\n  throughput %.2f req/s\n", totalRequests, float64(totalRequests)/duration.Seconds())
+	fmt.Printf("per connection:\n  min %.2f req/s\n  max %.2f req/s\n  avg %.2f req/s\n", min, max, float64(totalRequests)/float64(connections)/duration.Seconds())
+	fmt.Printf("request duration:\n  min %s\n  max %s\n  avg %s\n", minDuration, maxDuration, totalRequestDuration/time.Duration(totalRequests))
+	indexP95 := percentile(len(requestDurations), 0.95)
+	indexP99 := percentile(len(requestDurations), 0.99)
+	fmt.Printf("  p95 %s\n  p99 %s\n", requestDurations[indexP95], requestDurations[indexP99])
+	fmt.Printf("min %s  %d\n", requestDurations[0], len(requestDurations))
 }
 
-// test sends and reads bytes in chunks of size to the target until the context
-// is canceled. After requestsPerConn requests the connection is closed an
-// reopened. If requestPerConn is 0 all bytes are sent through the same
-// connection.
-func test(ctx context.Context, size int, requestsPerConn int) (int, error) {
-	var (
-		dialer   net.Dialer
-		conn     net.Conn
-		requests int
-	)
+func percentile(i int, p float64) int {
+	return int(math.Round(float64(i)*p+0.5)) - 1
+}
 
-	conn, err := dialer.DialContext(ctx, "tcp", TargetAddr)
-	if err != nil {
-		return requests, err
-	}
-	defer conn.Close()
+type Request struct {
+	Duration time.Duration
+}
 
-	buf := make([]byte, size)
+type Requester struct {
+	id              int
+	dialer          net.Dialer
+	target          string
+	size            int
+	requestsPerConn int
+	conn            net.Conn
+	// indexes to requests
+	connections []int
+	requests    []Request
+	done        chan struct{}
+}
 
+func (r *Requester) Stop() {
+	close(r.done)
+}
+
+// Run sends requests to target until context is canceled
+func (r *Requester) Run(ctx context.Context) error {
+	buf := make([]byte, r.size)
 	for {
 		select {
 		case <-ctx.Done():
-			return requests, nil
+			return nil
+		case <-r.done:
+			r.conn.Close()
+			return nil
 		default:
 		}
-
-		// reopen connection
-		if requestsPerConn != 0 && requests%requestsPerConn == 0 {
-			conn.Close()
-			conn, err = dialer.DialContext(ctx, "tcp", TargetAddr)
+		if len(r.requests) == 0 || r.requestsPerConn != 0 && len(r.requests)%r.requestsPerConn == 0 {
+			err := r.establishConn(ctx)
 			if err != nil {
-				return requests, err
+				return fmt.Errorf("failed to establish connection (%d): %w", r.id, err)
 			}
 		}
 
-		n, err := conn.Write(buf)
+		start := time.Now()
+		n, err := r.conn.Write(buf)
 		if err != nil {
-			return requests, err
+			return fmt.Errorf("failed to write (%d): %w", r.id, err)
 		}
-		n, err = conn.Read(buf)
-		if err != nil {
-			return requests, fmt.Errorf("failed to read bytes: %w", err)
+		received := 0
+		for {
+			n, err = r.conn.Read(buf)
+			if err != nil {
+				return fmt.Errorf("failed to read bytes (%d): %w", r.id, err)
+			}
+			received += n
+			if received == r.size {
+				break
+			}
 		}
-		if n != size {
-			return requests, fmt.Errorf("did not receive all bytes")
-		}
-		requests++
+		end := time.Now()
+		r.requests = append(r.requests, Request{end.Sub(start)})
 	}
+}
 
-	return requests, nil
+func (r *Requester) establishConn(ctx context.Context) error {
+	var err error
+	if r.conn != nil {
+		_ = r.conn.Close()
+	}
+	r.connections = append(r.connections, len(r.requests))
+	r.conn, err = r.dialer.DialContext(ctx, "tcp", r.target)
+	return err
 }
