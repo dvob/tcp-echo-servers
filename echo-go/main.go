@@ -32,6 +32,7 @@ func run() error {
 				log.Printf("failed to transfer byes to %s: %s", c.RemoteAddr(), err)
 				return
 			}
+			conn.Close()
 			//log.Printf("transferred %d to %s", n, c.RemoteAddr())
 		}(conn)
 	}
