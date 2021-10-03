@@ -10,14 +10,18 @@ import (
 	"time"
 )
 
+const TargetAddr = "127.0.0.1:1234"
+
 func main() {
 	var (
-		connections = 1
-		requestSize = 1024
-		duration    = time.Second * 1
+		connections     = 1
+		requestSize     = 1024
+		duration        = time.Second * 1
+		requestsPerConn = 0
 	)
 	flag.IntVar(&connections, "c", connections, "number of parallel connections")
 	flag.IntVar(&requestSize, "s", requestSize, "request size in bytes")
+	flag.IntVar(&requestsPerConn, "r", requestsPerConn, "how many requests do we send through one connection. if zero only one connection is used for all requests")
 	flag.DurationVar(&duration, "d", duration, "how long we run the test")
 	flag.Parse()
 
@@ -30,7 +34,7 @@ func main() {
 		wg.Add(1)
 		go func(i int) {
 			var err error
-			requests[i], err = test(ctx, requestSize)
+			requests[i], err = test(ctx, requestSize, requestsPerConn)
 			if err != nil {
 				log.Println(err)
 			}
@@ -39,28 +43,39 @@ func main() {
 	}
 	wg.Wait()
 	total := 0
-	min := requests[0]
-	max := 0
-	for _, req := range requests {
+	min := float64(requests[0]) / duration.Seconds()
+	max := 0.0
+	for _, request := range requests {
+		req := float64(request) / duration.Seconds()
 		if req < min {
 			min = req
 		}
 		if req > max {
 			max = req
 		}
-		total += req
+		total += request
 	}
-	fmt.Printf("%.2f req/s\n", float64(total)/duration.Seconds())
-	fmt.Printf("reqest per connection: min=%d, max=%d, avg=%d\n", min, max, total/connections)
+	fmt.Printf("total: %.2f req/s\n", float64(total)/duration.Seconds())
+	fmt.Printf("per connection:\n  min %.2f req/s\n  max %.2f req/s\n  avg %.2f req/s\n", min, max, float64(total)/float64(connections)/duration.Seconds())
 }
 
-func test(ctx context.Context, size int) (int, error) {
-	requests := 0
-	conn, err := net.Dial("tcp", "127.0.0.1:1234")
+// test sends and reads bytes in chunks of size to the target until the context
+// is canceled. After requestsPerConn requests the connection is closed an
+// reopened. If requestPerConn is 0 all bytes are sent through the same
+// connection.
+func test(ctx context.Context, size int, requestsPerConn int) (int, error) {
+	var (
+		dialer   net.Dialer
+		conn     net.Conn
+		requests int
+	)
+
+	conn, err := dialer.DialContext(ctx, "tcp", TargetAddr)
 	if err != nil {
 		return requests, err
 	}
 	defer conn.Close()
+
 	buf := make([]byte, size)
 
 	for {
@@ -68,6 +83,15 @@ func test(ctx context.Context, size int) (int, error) {
 		case <-ctx.Done():
 			return requests, nil
 		default:
+		}
+
+		// reopen connection
+		if requestsPerConn != 0 && requests%requestsPerConn == 0 {
+			conn.Close()
+			conn, err = dialer.DialContext(ctx, "tcp", TargetAddr)
+			if err != nil {
+				return requests, err
+			}
 		}
 
 		n, err := conn.Write(buf)
