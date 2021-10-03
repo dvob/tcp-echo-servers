@@ -11,9 +11,16 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/buger/goterm"
 )
+
+var _ = unsafe.Sizeof(0)
+
+//go:noescape
+//go:linkname nanotime runtime.nanotime
+func nanotime() int64
 
 const DefaultTargetAddr = "127.0.0.1:1234"
 
@@ -201,7 +208,7 @@ func (r *Requester) Run(ctx context.Context) error {
 			}
 		}
 
-		start := time.Now()
+		start := nanotime()
 		n, err := r.conn.Write(buf)
 		if err != nil {
 			return fmt.Errorf("failed to write (%d): %w", r.id, err)
@@ -217,8 +224,8 @@ func (r *Requester) Run(ctx context.Context) error {
 				break
 			}
 		}
-		end := time.Now()
-		r.requests = append(r.requests, Request{end.Sub(start)})
+		end := nanotime()
+		r.requests = append(r.requests, Request{time.Duration(end - start)})
 	}
 }
 
