@@ -32,6 +32,7 @@ func main() {
 		requestsPerConn = 0
 		target          string
 		showGraph       = false
+		markdown        = false
 	)
 	flag.IntVar(&connections, "c", connections, "number of parallel connections")
 	flag.IntVar(&requestSize, "s", requestSize, "request jize in bytes")
@@ -39,6 +40,7 @@ func main() {
 	flag.StringVar(&target, "t", DefaultTargetAddr, "target address")
 	flag.DurationVar(&duration, "d", duration, "how long we run the test")
 	flag.BoolVar(&showGraph, "g", showGraph, "show a graph with response times")
+	flag.BoolVar(&markdown, "m", markdown, "markdown outpu")
 	flag.Parse()
 
 	// prepare requesters
@@ -83,11 +85,16 @@ func main() {
 		printTerminalGraph(result)
 	}
 
+	if markdown {
+		printMarkdown(result)
+	}
+
 }
 
 type Result struct {
 	Duration               time.Duration
 	ConnectionsTotal       int
+	ConnectionsPerSecond   float64
 	RequestsTotal          int
 	RequestsPerSecond      float64
 	RequestDurationTotal   time.Duration
@@ -124,6 +131,7 @@ func ResultFromRequesters(requesters []*Requester, duration time.Duration) *Resu
 
 	result.RequestsPerSecond = float64(result.RequestsTotal) / result.Duration.Seconds()
 	result.RequestDurationAverage = result.RequestDurationTotal / time.Duration(result.RequestsTotal)
+	result.ConnectionsPerSecond = float64(result.ConnectionsTotal) / result.Duration.Seconds()
 
 	sort.Slice(result.Durations, func(i, j int) bool { return result.Durations[i] < result.Durations[j] })
 	indexP95 := percentile(len(result.Durations), 0.95)
@@ -137,10 +145,12 @@ func ResultFromRequesters(requesters []*Requester, duration time.Duration) *Resu
 func (r *Result) Text() string {
 	out := &bytes.Buffer{}
 
-	fmt.Fprintf(out, "total connections: %d\n", r.ConnectionsTotal)
+	fmt.Fprintf(out, "connections:\n")
+	fmt.Fprintf(out, "  total %d\n", r.ConnectionsTotal)
+	fmt.Fprintf(out, "  per second %.2f\n", r.ConnectionsPerSecond)
 	fmt.Fprintf(out, "requests:\n")
 	fmt.Fprintf(out, "  total %d\n", r.RequestsTotal)
-	fmt.Fprintf(out, "  throughput %.2f req/s\n", r.RequestsPerSecond)
+	fmt.Fprintf(out, "  per second %.2f req/s\n", r.RequestsPerSecond)
 	fmt.Fprintf(out, "request duration:\n")
 	fmt.Fprintf(out, "  avg %s\n", r.RequestDurationAverage)
 	fmt.Fprintf(out, "  min %s\n", r.RequestDurationMin)
@@ -148,6 +158,16 @@ func (r *Result) Text() string {
 	fmt.Fprintf(out, "  p95 %s\n", r.RequestDurationP95)
 	fmt.Fprintf(out, "  p99 %s\n", r.RequestDurationP99)
 	return out.String()
+}
+func printMarkdown(r *Result) {
+	fmt.Printf("| type | %.2f | %.2f | %s | %s | %s | %s | %s | rss | user | system |\n",
+		r.RequestsPerSecond,
+		r.ConnectionsPerSecond,
+		r.RequestDurationAverage,
+		r.RequestDurationMin,
+		r.RequestDurationMax,
+		r.RequestDurationP95,
+		r.RequestDurationP99)
 }
 
 func printTerminalGraph(r *Result) {
