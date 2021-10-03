@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/buger/goterm"
 )
 
 const DefaultTargetAddr = "127.0.0.1:1234"
@@ -21,12 +23,14 @@ func main() {
 		duration        = time.Second * 1
 		requestsPerConn = 0
 		target          string
+		showGraph       = false
 	)
 	flag.IntVar(&connections, "c", connections, "number of parallel connections")
 	flag.IntVar(&requestSize, "s", requestSize, "request jize in bytes")
 	flag.IntVar(&requestsPerConn, "r", requestsPerConn, "how many requests do we send through one connection. if zero only one connection is used for all requests")
 	flag.StringVar(&target, "t", DefaultTargetAddr, "target address")
 	flag.DurationVar(&duration, "d", duration, "how long we run the test")
+	flag.BoolVar(&showGraph, "g", showGraph, "show a graph with response times")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -101,6 +105,20 @@ func main() {
 	indexP99 := percentile(len(requestDurations), 0.99)
 	fmt.Printf("  p95 %s\n  p99 %s\n", requestDurations[indexP95], requestDurations[indexP99])
 	fmt.Printf("min %s  %d\n", requestDurations[0], len(requestDurations))
+
+	if showGraph {
+		chart := goterm.NewLineChart(100, 20)
+		data := &goterm.DataTable{}
+		data.AddColumn("request")
+		data.AddColumn("duration")
+
+		for i, dur := range requestDurations {
+			data.AddRow(float64(i), dur.Seconds())
+		}
+
+		goterm.Println(chart.Draw(data))
+		goterm.Flush()
+	}
 }
 
 func percentile(i int, p float64) int {
